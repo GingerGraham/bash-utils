@@ -24,6 +24,7 @@ fail_with_context() {
   local expected_outcome="$2"
   local check_next="$3"
   local details="$4"
+  trap - ERR
   echo -e "${RED}[ERROR]${RESET} Step failed: ${step_name}" >&2
   echo -e "${RED}[ERROR]${RESET} Expected outcome: ${expected_outcome}" >&2
   echo -e "${RED}[ERROR]${RESET} What to check: ${check_next}" >&2
@@ -50,6 +51,15 @@ ORIG_AUTHSELECT_FEATURES=()
 ORIG_U2F_EXISTS=false
 ORIG_TOTP_EXISTS=false
 SELINUX_MODULE_PREEXISTED=false
+
+# Core paths/constants are defined early because preflight mode executes before
+# the main setup path and still needs these values.
+CURRENT_USER="${USER:-$(id -un)}"
+GDM_PAM="/etc/pam.d/gdm-password"
+U2F_MAPPINGS="/etc/u2f_mappings"
+SELINUX_MODULE_NAME="gdm-google-auth"
+SELINUX_MODULE_NAME_ALT="${SELINUX_MODULE_NAME//-/_}"
+AUTHSELECT_PROFILE="custom/mfa-login"
 
 rollback_state() {
   if [[ "$ROLLBACK_ACTIVE" != true || "$ROLLBACK_COMPLETED" == true ]]; then
@@ -111,6 +121,8 @@ rollback_state() {
   if [[ "$SELINUX_CHANGED" == true && "$SELINUX_MODULE_PREEXISTED" == false ]]; then
     if sudo semodule -r "$SELINUX_MODULE_NAME"; then
       success "Rollback: removed SELinux module '$SELINUX_MODULE_NAME'"
+    elif sudo semodule -r "$SELINUX_MODULE_NAME_ALT"; then
+      success "Rollback: removed SELinux module '$SELINUX_MODULE_NAME_ALT'"
     else
       warn "Rollback warning: failed to remove SELinux module '$SELINUX_MODULE_NAME'"
     fi
@@ -154,6 +166,62 @@ prompt_yes_no() {
 
   read -rp "$prompt" yn < /dev/tty
   [[ "${yn,,}" == "y" ]]
+}
+
+capture_u2f_mapping_with_retry() {
+  local username="$1"
+  local mode="${2:-primary}"
+  local max_attempts=3
+  local attempt=1
+  local err_file=''
+  local mapping=''
+  local pamu2f_cmd=(pamu2fcfg -u "$username")
+
+  [[ "$mode" == "backup" ]] && pamu2f_cmd+=( -n )
+
+  err_file="$(mktemp)"
+  if [[ -z "$err_file" || ! -f "$err_file" ]]; then
+    fail_with_context \
+      "YubiKey registration temporary file setup" \
+      "A temporary diagnostics file is created" \
+      "Check /tmp free space and permissions" \
+      "mktemp failed before pamu2fcfg execution"
+  fi
+
+  while [[ "$attempt" -le "$max_attempts" ]]; do
+    info "YubiKey registration attempt $attempt/$max_attempts"
+    if mapping="$("${pamu2f_cmd[@]}" 2>"$err_file")" && [[ -n "$mapping" ]]; then
+      rm -f "$err_file" 2>/dev/null || true
+      printf '%s\n' "$mapping"
+      return 0
+    fi
+
+    if grep -qi "No FIDO authenticator available" "$err_file" 2>/dev/null; then
+      warn "No local FIDO authenticator detected by the remote host on attempt $attempt."
+      warn "If using SSH, VM, or containerized test hosts, the YubiKey must be visible to the execution environment."
+      warn "For KVM/virt-manager guests, verify USB passthrough of the YubiKey device (all interfaces, including FIDO)."
+    else
+      warn "YubiKey registration attempt $attempt did not produce a valid mapping."
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  rm -f "$err_file" 2>/dev/null || true
+  return 1
+}
+
+selinux_module_is_installed() {
+  sudo semodule -l 2>/dev/null | awk -v m1="$SELINUX_MODULE_NAME" -v m2="$SELINUX_MODULE_NAME_ALT" '
+    $1 == m1 || $1 == m2 { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+show_selinux_module_entries() {
+  sudo semodule -l 2>/dev/null | awk -v m1="$SELINUX_MODULE_NAME" -v m2="$SELINUX_MODULE_NAME_ALT" '
+    $1 == m1 || $1 == m2 { print }
+  '
 }
 
 validate_injected_stage() {
@@ -429,12 +497,20 @@ show_compatibility_banner() {
 
   local os_id='unknown'
   local os_like=''
+  local os_like_display=''
   local distro_ok=false
 
   if [[ -f /etc/os-release ]]; then
     os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2; exit}' /etc/os-release)"
     os_like="$(awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2); print $2; exit}' /etc/os-release)"
     [[ -z "$os_id" ]] && os_id='unknown'
+  fi
+
+  if [[ -n "$os_like" ]]; then
+    os_like_display="$os_like"
+  else
+    # Fedora commonly omits ID_LIKE; this is informative rather than an error.
+    os_like_display='<unset>'
   fi
 
   case "$os_id" in
@@ -447,7 +523,7 @@ show_compatibility_banner() {
 
   echo ""
   echo -e "${BOLD}Intended environment:${RESET} Fedora/RHEL-like Linux with GNOME GDM, PAM, authselect, dnf, and SELinux"
-  echo -e "${BOLD}Detected environment:${RESET} ID=${os_id} ID_LIKE=${os_like:-<none>}"
+  echo -e "${BOLD}Detected environment:${RESET} ID=${os_id} ID_LIKE=${os_like_display}"
 
   if [[ "$distro_ok" == true ]]; then
     COMPATIBILITY_SUPPORTED=true
@@ -530,12 +606,6 @@ if [[ "$PREFLIGHT_ONLY" == true ]]; then
   exit 0
 fi
 
-CURRENT_USER="$USER"
-GDM_PAM="/etc/pam.d/gdm-password"
-U2F_MAPPINGS="/etc/u2f_mappings"
-SELINUX_MODULE_NAME="gdm-google-auth"
-AUTHSELECT_PROFILE="custom/mfa-login"
-
 show_compatibility_banner
 
 step "Checking prerequisites"
@@ -545,20 +615,28 @@ for cmd in sudo authselect rpm dnf grep sed awk mktemp; do
 done
 
 # Check authselect current profile
-CURRENT_PROFILE=$(authselect current --raw 2>/dev/null | head -1 || true)
-if [[ -z "$CURRENT_PROFILE" ]]; then
+CURRENT_PROFILE_RAW=$(authselect current --raw 2>/dev/null | head -1 || true)
+if [[ -z "$CURRENT_PROFILE_RAW" ]]; then
   error "Could not determine current authselect profile. Is authselect installed?"
 fi
-info "Current authselect profile: $CURRENT_PROFILE"
-ORIG_AUTHSELECT_PROFILE="$CURRENT_PROFILE"
+read -r -a CURRENT_PROFILE_PARTS <<< "$CURRENT_PROFILE_RAW"
+CURRENT_PROFILE_ID="${CURRENT_PROFILE_PARTS[0]}"
+CURRENT_FEATURES=("${CURRENT_PROFILE_PARTS[@]:1}")
 
-# Capture enabled authselect features (e.g. with-fingerprint) for rollback.
-mapfile -t ORIG_AUTHSELECT_FEATURES < <(authselect current 2>/dev/null | awk '/^- / {print $2}')
+info "Current authselect profile: $CURRENT_PROFILE_ID"
+if [[ ${#CURRENT_FEATURES[@]} -gt 0 ]]; then
+  info "Current authselect features: ${CURRENT_FEATURES[*]}"
+else
+  info "Current authselect features: <none>"
+fi
+
+ORIG_AUTHSELECT_PROFILE="$CURRENT_PROFILE_ID"
+ORIG_AUTHSELECT_FEATURES=("${CURRENT_FEATURES[@]}")
 
 # Warn if not on 'local' profile
-if [[ "$CURRENT_PROFILE" != "local" && "$CURRENT_PROFILE" != "$AUTHSELECT_PROFILE" ]]; then
-  warn "Current profile is '$CURRENT_PROFILE', not 'local'."
-  warn "The authselect step will use '$CURRENT_PROFILE' as the base. Review the result."
+if [[ "$CURRENT_PROFILE_ID" != "local" && "$CURRENT_PROFILE_ID" != "$AUTHSELECT_PROFILE" ]]; then
+  warn "Current profile is '$CURRENT_PROFILE_ID', not 'local'."
+  warn "The authselect step will use '$CURRENT_PROFILE_ID' as the base. Review the result."
 fi
 
 run_preflight_checks
@@ -608,7 +686,7 @@ else
     fi
   fi
 
-  if sudo semodule -l | grep -q "^${SELINUX_MODULE_NAME}[[:space:]]"; then
+  if selinux_module_is_installed; then
     SELINUX_MODULE_PREEXISTED=true
   fi
 
@@ -679,7 +757,7 @@ if [[ "$SKIP_AUTHSELECT" == false ]]; then
   if authselect list 2>/dev/null | grep -q "custom/mfa-login"; then
     warn "Profile 'custom/mfa-login' already exists — skipping creation"
   else
-    BASE_PROFILE="$CURRENT_PROFILE"
+    BASE_PROFILE="$CURRENT_PROFILE_ID"
     [[ "$BASE_PROFILE" == "$AUTHSELECT_PROFILE" ]] && BASE_PROFILE="local"
     if is_dry_run; then
       info "[dry-run] Would run: sudo authselect create-profile mfa-login --base-on $BASE_PROFILE"
@@ -703,29 +781,39 @@ if [[ "$SKIP_AUTHSELECT" == false ]]; then
     fi
   fi
 
-  if [[ "$CURRENT_PROFILE" != "$AUTHSELECT_PROFILE" ]]; then
+  TARGET_AUTHSELECT_FEATURES=("${CURRENT_FEATURES[@]}")
+  if [[ " ${TARGET_AUTHSELECT_FEATURES[*]} " != *" with-fingerprint "* ]]; then
+    TARGET_AUTHSELECT_FEATURES+=(with-fingerprint)
+  fi
+
+  if [[ "$CURRENT_PROFILE_ID" != "$AUTHSELECT_PROFILE" ]]; then
     if is_dry_run; then
-      info "[dry-run] Would run: sudo authselect select $AUTHSELECT_PROFILE with-fingerprint --force"
+      if [[ ${#TARGET_AUTHSELECT_FEATURES[@]} -gt 0 ]]; then
+        info "[dry-run] Would run: sudo authselect select $AUTHSELECT_PROFILE ${TARGET_AUTHSELECT_FEATURES[*]} --force"
+      else
+        info "[dry-run] Would run: sudo authselect select $AUTHSELECT_PROFILE --force"
+      fi
     else
-      if ! sudo authselect select "$AUTHSELECT_PROFILE" with-fingerprint --force; then
+      if ! sudo authselect select "$AUTHSELECT_PROFILE" "${TARGET_AUTHSELECT_FEATURES[@]}" --force; then
         fail_with_context \
           "Authselect profile selection" \
-          "Profile '$AUTHSELECT_PROFILE' with 'with-fingerprint' is active" \
+          "Profile '$AUTHSELECT_PROFILE' is active with intended features" \
           "Check authselect feature support and existing PAM customizations" \
           "authselect select failed"
       fi
 
       AUTHSELECT_CHANGED=true
 
-      UPDATED_PROFILE=$(authselect current --raw 2>/dev/null | head -1 || true)
-      if [[ "$UPDATED_PROFILE" != "$AUTHSELECT_PROFILE" ]]; then
+      UPDATED_PROFILE_RAW=$(authselect current --raw 2>/dev/null | head -1 || true)
+      UPDATED_PROFILE_ID="${UPDATED_PROFILE_RAW%% *}"
+      if [[ "$UPDATED_PROFILE_ID" != "$AUTHSELECT_PROFILE" ]]; then
         fail_with_context \
           "Authselect profile selection verification" \
           "Current authselect profile is '$AUTHSELECT_PROFILE'" \
           "Run 'authselect current' and verify no conflicting manual PAM edits" \
-          "Current profile after selection: '${UPDATED_PROFILE:-unknown}'"
+          "Current profile after selection: '${UPDATED_PROFILE_ID:-unknown}'"
       fi
-      success "Profile '$AUTHSELECT_PROFILE' with-fingerprint applied"
+      success "Profile '$AUTHSELECT_PROFILE' applied with preserved features"
     fi
   else
     success "Profile '$AUTHSELECT_PROFILE' already active"
@@ -766,12 +854,12 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
       warn "YubiKey mapping for '$CURRENT_USER' already exists in $U2F_MAPPINGS"
       if prompt_yes_no "Register an additional/replacement key? [y/N] "; then
         info "Touch your YubiKey when prompted..."
-        if ! MAPPING=$(pamu2fcfg -u "$CURRENT_USER"); then
+        if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" primary)"; then
           fail_with_context \
             "Primary YubiKey registration" \
             "A valid U2F mapping is generated for '$CURRENT_USER'" \
-            "Ensure key is inserted/touched and supports U2F/FIDO2" \
-            "pamu2fcfg failed while reading primary key"
+            "Ensure the key is attached to the machine running this script and supports U2F/FIDO2" \
+            "pamu2fcfg failed after 3 attempts"
         fi
         # Replace existing entry for this user
         ESCAPED_USER=$(printf '%s' "$CURRENT_USER" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
@@ -802,12 +890,12 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
       fi
     else
       info "Touch your YubiKey when prompted..."
-      if ! MAPPING=$(pamu2fcfg -u "$CURRENT_USER"); then
+      if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" primary)"; then
         fail_with_context \
           "Primary YubiKey registration" \
           "A valid U2F mapping is generated for '$CURRENT_USER'" \
-          "Ensure key is inserted/touched and supports U2F/FIDO2" \
-          "pamu2fcfg failed while reading primary key"
+          "Ensure the key is attached to the machine running this script and supports U2F/FIDO2" \
+          "pamu2fcfg failed after 3 attempts"
       fi
       if ! echo "$MAPPING" | sudo tee -a "$U2F_MAPPINGS" > /dev/null; then
         fail_with_context \
@@ -831,12 +919,19 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
 
     if prompt_yes_no "Register a backup YubiKey? [y/N] "; then
       info "Touch your backup YubiKey..."
-      if ! pamu2fcfg -u "$CURRENT_USER" -n | sudo tee -a "$U2F_MAPPINGS" > /dev/null; then
+      if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" backup)"; then
+        fail_with_context \
+          "Backup YubiKey registration" \
+          "A valid backup key mapping is generated for '$CURRENT_USER'" \
+          "Ensure the backup key is attached to the machine running this script and supports U2F/FIDO2" \
+          "pamu2fcfg failed after 3 attempts"
+      fi
+      if ! echo "$MAPPING" | sudo tee -a "$U2F_MAPPINGS" > /dev/null; then
         fail_with_context \
           "Backup YubiKey registration" \
           "Backup key mapping is appended for '$CURRENT_USER'" \
-          "Ensure backup key is present/touched and supports U2F/FIDO2" \
-          "pamu2fcfg failed while reading backup key"
+          "Check sudo privileges and destination file permissions" \
+          "Failed writing backup mapping"
       fi
       U2F_CHANGED=true
       success "Backup YubiKey registered"
@@ -859,8 +954,8 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
         "Current mode is '${U2F_MODE:-unknown}'"
     fi
 
-    info "YubiKey mappings:"
-    cat "$U2F_MAPPINGS"
+    USER_MAPPING_COUNT=$(cut -d: -f1 "$U2F_MAPPINGS" 2>/dev/null | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+    success "YubiKey mappings updated in $U2F_MAPPINGS (${USER_MAPPING_COUNT:-0} user entries)"
   fi
 else
   warn "Skipping YubiKey registration (--skip-yubikey)"
@@ -1125,7 +1220,7 @@ if [[ "$SELINUX_MODE" == "Disabled" ]]; then
 fi
 
 if [[ "${SELINUX_SKIPPED:-false}" != true ]]; then
-  if sudo semodule -l | grep -q "^${SELINUX_MODULE_NAME}[[:space:]]"; then
+  if selinux_module_is_installed; then
     success "SELinux module '${SELINUX_MODULE_NAME}' already installed; no change needed"
   else
     if is_dry_run; then
@@ -1186,13 +1281,13 @@ EOF
   # Verify
   if is_dry_run; then
     info "[dry-run] Skipping strict SELinux activation verification"
-  elif sudo semodule -l | grep -q "^${SELINUX_MODULE_NAME}[[:space:]]"; then
+  elif selinux_module_is_installed; then
     success "SELinux module confirmed active:"
-    sudo semodule -l | grep "^${SELINUX_MODULE_NAME}[[:space:]]"
+    show_selinux_module_entries
   else
     fail_with_context \
       "SELinux module verification" \
-      "Module '$SELINUX_MODULE_NAME' appears in semodule -l" \
+      "Module '$SELINUX_MODULE_NAME' (or '$SELINUX_MODULE_NAME_ALT') appears in semodule -l" \
       "Check semodule installation logs and module name consistency" \
       "Module not found after installation"
   fi
