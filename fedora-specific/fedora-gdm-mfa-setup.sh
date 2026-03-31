@@ -1089,12 +1089,16 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
             "Ensure the backup key is attached to the machine running this script and supports U2F/FIDO2" \
             "pamu2fcfg failed after 3 attempts"
         fi
-        if ! echo "$MAPPING" | sudo tee -a "$U2F_MAPPINGS" > /dev/null; then
+        # pamu2fcfg -n outputs ":key_data..." — must be appended to the end of the
+        # existing user line (not a new line) so all keys stay colon-separated on one line.
+        ESCAPED_USER=$(printf '%s' "$CURRENT_USER" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
+        ESCAPED_MAPPING=$(printf '%s' "$MAPPING" | sed 's/[\/&]/\\&/g')
+        if ! sudo sed -i "s/^${ESCAPED_USER}:.*$/&${ESCAPED_MAPPING}/" "$U2F_MAPPINGS"; then
           fail_with_context \
             "Backup YubiKey registration" \
-            "Backup key mapping is appended for '$CURRENT_USER'" \
+            "Backup key mapping is appended to '$CURRENT_USER' line in $U2F_MAPPINGS" \
             "Check sudo privileges and destination file permissions" \
-            "Failed writing backup mapping"
+            "Failed to append backup mapping to user line"
         fi
         U2F_CHANGED=true
         success "Backup YubiKey registered"
