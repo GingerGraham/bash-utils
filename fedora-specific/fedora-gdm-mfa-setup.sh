@@ -175,6 +175,7 @@ capture_u2f_mapping_with_retry() {
   local attempt=1
   local err_file=''
   local mapping=''
+  local mapping_line=''
   local pamu2f_cmd=(pamu2fcfg -u "$username")
 
   [[ "$mode" == "backup" ]] && pamu2f_cmd+=( -n )
@@ -189,19 +190,31 @@ capture_u2f_mapping_with_retry() {
   fi
 
   while [[ "$attempt" -le "$max_attempts" ]]; do
-    info "YubiKey registration attempt $attempt/$max_attempts"
+    info "YubiKey registration attempt $attempt/$max_attempts" >&2
     if mapping="$("${pamu2f_cmd[@]}" 2>"$err_file")" && [[ -n "$mapping" ]]; then
-      rm -f "$err_file" 2>/dev/null || true
-      printf '%s\n' "$mapping"
-      return 0
+      mapping_line="$(printf '%s\n' "$mapping" | sed '/^[[:space:]]*$/d' | tail -n 1)"
+
+      if [[ "$mode" == "primary" && "$mapping_line" == "$username":* ]]; then
+        rm -f "$err_file" 2>/dev/null || true
+        printf '%s\n' "$mapping_line"
+        return 0
+      fi
+
+      if [[ "$mode" == "backup" && "$mapping_line" == :* ]]; then
+        rm -f "$err_file" 2>/dev/null || true
+        printf '%s\n' "$mapping_line"
+        return 0
+      fi
+
+      warn "YubiKey registration attempt $attempt produced unexpected mapping format; retrying." >&2
     fi
 
     if grep -qi "No FIDO authenticator available" "$err_file" 2>/dev/null; then
-      warn "No local FIDO authenticator detected by the remote host on attempt $attempt."
-      warn "If using SSH, VM, or containerized test hosts, the YubiKey must be visible to the execution environment."
-      warn "For KVM/virt-manager guests, verify USB passthrough of the YubiKey device (all interfaces, including FIDO)."
+      warn "No local FIDO authenticator detected by the remote host on attempt $attempt." >&2
+      warn "If using SSH, VM, or containerized test hosts, the YubiKey must be visible to the execution environment." >&2
+      warn "For KVM/virt-manager guests, verify USB passthrough of the YubiKey device (all interfaces, including FIDO)." >&2
     else
-      warn "YubiKey registration attempt $attempt did not produce a valid mapping."
+      warn "YubiKey registration attempt $attempt did not produce a valid mapping." >&2
     fi
 
     attempt=$((attempt + 1))
@@ -264,6 +277,11 @@ OPTIONS
 
   --skip-totp                  Skip TOTP (Google Authenticator) setup
   --skip-yubikey               Skip YubiKey (U2F/FIDO2) setup
+  --reset-totp                 Re-enroll TOTP secret and keep TOTP MFA enabled
+  --reset-yubikey              Re-enroll YubiKey mapping and keep YubiKey MFA enabled
+  --disable-totp               Disable TOTP MFA and remove local TOTP secret
+  --disable-yubikey            Disable YubiKey MFA for current user mapping
+  --disable-mfa                Disable both TOTP and YubiKey MFA
   --skip-authselect            Skip authselect custom profile setup
   --dry-run                    Preview all changes without system mutations
   --preflight                  Run environment validation only, exit without setup
@@ -306,6 +324,11 @@ OPTIONS
 Configuration Flags:
   --skip-totp                  Skip TOTP (Google Authenticator) setup
   --skip-yubikey               Skip YubiKey (U2F/FIDO2) setup
+  --reset-totp                 Re-enroll TOTP secret and keep TOTP MFA enabled
+  --reset-yubikey              Re-enroll YubiKey mapping and keep YubiKey MFA enabled
+  --disable-totp               Disable TOTP MFA and remove local TOTP secret
+  --disable-yubikey            Disable YubiKey MFA for current user mapping
+  --disable-mfa                Disable both TOTP and YubiKey MFA
   --skip-authselect            Skip authselect custom profile setup
 
 Testing & Debugging:
@@ -354,6 +377,18 @@ bash gdm-mfa-setup.sh --dry-run
 
 # Skip YubiKey, only set up TOTP (Google Authenticator)
 bash gdm-mfa-setup.sh --skip-yubikey
+
+# Reset TOTP secret while keeping TOTP MFA enabled
+bash gdm-mfa-setup.sh --skip-yubikey --reset-totp
+
+# Reset YubiKey mapping while keeping YubiKey MFA enabled
+bash gdm-mfa-setup.sh --skip-totp --reset-yubikey
+
+# Disable TOTP while leaving YubiKey MFA enabled
+bash gdm-mfa-setup.sh --disable-totp
+
+# Disable all MFA factors (password-only login path)
+bash gdm-mfa-setup.sh --disable-mfa
 
 # Test rollback behavior at PAM modification stage
 bash gdm-mfa-setup.sh --inject-failure-at=after-pam
@@ -568,11 +603,21 @@ require_cmd() {
 SKIP_TOTP=false
 SKIP_YUBIKEY=false
 SKIP_AUTHSELECT=false
+RESET_TOTP=false
+RESET_YUBIKEY=false
+DISABLE_TOTP=false
+DISABLE_YUBIKEY=false
+DISABLE_MFA=false
 
 for arg in "$@"; do
   case "$arg" in
     --skip-totp)        SKIP_TOTP=true ;;
     --skip-yubikey)     SKIP_YUBIKEY=true ;;
+    --reset-totp)       RESET_TOTP=true ;;
+    --reset-yubikey)    RESET_YUBIKEY=true ;;
+    --disable-totp)     DISABLE_TOTP=true ;;
+    --disable-yubikey)  DISABLE_YUBIKEY=true ;;
+    --disable-mfa)      DISABLE_MFA=true ;;
     --skip-authselect)  SKIP_AUTHSELECT=true ;;
     --dry-run)          DRY_RUN=true ;;
     --preflight)        PREFLIGHT_ONLY=true ;;
@@ -590,6 +635,51 @@ for arg in "$@"; do
 done
 
 validate_injected_stage
+
+if [[ "$DISABLE_MFA" == true ]]; then
+  DISABLE_TOTP=true
+  DISABLE_YUBIKEY=true
+fi
+
+if [[ "$RESET_TOTP" == true && "$SKIP_TOTP" == true ]]; then
+  fail_with_context \
+    "Option validation" \
+    "Reset and skip options for TOTP are not used together" \
+    "Remove either --reset-totp or --skip-totp" \
+    "Conflicting options: --reset-totp with --skip-totp"
+fi
+
+if [[ "$RESET_YUBIKEY" == true && "$SKIP_YUBIKEY" == true ]]; then
+  fail_with_context \
+    "Option validation" \
+    "Reset and skip options for YubiKey are not used together" \
+    "Remove either --reset-yubikey or --skip-yubikey" \
+    "Conflicting options: --reset-yubikey with --skip-yubikey"
+fi
+
+if [[ "$RESET_TOTP" == true && "$DISABLE_TOTP" == true ]]; then
+  fail_with_context \
+    "Option validation" \
+    "Reset and disable options for TOTP are not used together" \
+    "Remove either --reset-totp or --disable-totp/--disable-mfa" \
+    "Conflicting options: --reset-totp with --disable-totp/--disable-mfa"
+fi
+
+if [[ "$RESET_YUBIKEY" == true && "$DISABLE_YUBIKEY" == true ]]; then
+  fail_with_context \
+    "Option validation" \
+    "Reset and disable options for YubiKey are not used together" \
+    "Remove either --reset-yubikey or --disable-yubikey/--disable-mfa" \
+    "Conflicting options: --reset-yubikey with --disable-yubikey/--disable-mfa"
+fi
+
+if [[ "$DISABLE_TOTP" == true ]]; then
+  SKIP_TOTP=true
+fi
+
+if [[ "$DISABLE_YUBIKEY" == true ]]; then
+  SKIP_YUBIKEY=true
+fi
 
 if [[ "$SELF_TEST" == true && "$SELF_TEST_CHILD" != true ]]; then
   run_self_test_suite
@@ -699,7 +789,13 @@ maybe_inject_failure "after-snapshot"
 # ── Step 1: Install packages ───────────────────────────────────────────────────
 step "Installing required packages"
 
-PACKAGES=(google-authenticator pam-u2f pamu2fcfg pamtester policycoreutils-python-utils)
+PACKAGES=(pamtester policycoreutils-python-utils)
+if [[ "$SKIP_TOTP" == false ]]; then
+  PACKAGES+=(google-authenticator)
+fi
+if [[ "$SKIP_YUBIKEY" == false ]]; then
+  PACKAGES+=(pam-u2f pamu2fcfg)
+fi
 MISSING=()
 
 for pkg in "${PACKAGES[@]}"; do
@@ -739,11 +835,27 @@ fi
 maybe_inject_failure "after-packages"
 
 if ! is_dry_run; then
-  for cmd in google-authenticator pamu2fcfg pamtester checkmodule semodule_package semodule getenforce; do
+  REQUIRED_CMDS=(pamtester checkmodule semodule_package semodule getenforce)
+  if [[ "$SKIP_TOTP" == false ]]; then
+    REQUIRED_CMDS+=(google-authenticator)
+  fi
+  if [[ "$SKIP_YUBIKEY" == false ]]; then
+    REQUIRED_CMDS+=(pamu2fcfg)
+  fi
+
+  for cmd in "${REQUIRED_CMDS[@]}"; do
     require_cmd "$cmd"
   done
 else
-  for cmd in google-authenticator pamu2fcfg pamtester checkmodule semodule_package semodule getenforce; do
+  REQUIRED_CMDS=(pamtester checkmodule semodule_package semodule getenforce)
+  if [[ "$SKIP_TOTP" == false ]]; then
+    REQUIRED_CMDS+=(google-authenticator)
+  fi
+  if [[ "$SKIP_YUBIKEY" == false ]]; then
+    REQUIRED_CMDS+=(pamu2fcfg)
+  fi
+
+  for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       warn "[dry-run] Missing command (would fail during real run): $cmd"
     fi
@@ -833,6 +945,9 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
 
   if is_dry_run; then
     info "[dry-run] Would verify/update $U2F_MAPPINGS for user '$CURRENT_USER'"
+    if [[ "$RESET_YUBIKEY" == true ]]; then
+      info "[dry-run] Reset mode enabled: existing mapping for '$CURRENT_USER' would be replaced"
+    fi
     if [[ -f "$U2F_MAPPINGS" ]]; then
       info "[dry-run] Existing mappings detected in $U2F_MAPPINGS"
     else
@@ -852,7 +967,16 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
 
     if [[ -f "$U2F_MAPPINGS" ]] && grep -q "^${CURRENT_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
       warn "YubiKey mapping for '$CURRENT_USER' already exists in $U2F_MAPPINGS"
-      if prompt_yes_no "Register an additional/replacement key? [y/N] "; then
+      if [[ "$RESET_YUBIKEY" == true ]]; then
+        info "Reset mode enabled: replacing existing YubiKey mapping for '$CURRENT_USER'"
+        REPLACE_YUBIKEY_MAPPING=true
+      elif prompt_yes_no "Register an additional/replacement key? [y/N] "; then
+        REPLACE_YUBIKEY_MAPPING=true
+      else
+        REPLACE_YUBIKEY_MAPPING=false
+      fi
+
+      if [[ "${REPLACE_YUBIKEY_MAPPING:-false}" == true ]]; then
         info "Touch your YubiKey when prompted..."
         if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" primary)"; then
           fail_with_context \
@@ -968,6 +1092,9 @@ if [[ "$SKIP_TOTP" == false ]]; then
   step "Setting up TOTP (Google Authenticator)"
 
   if is_dry_run; then
+    if [[ "$RESET_TOTP" == true ]]; then
+      info "[dry-run] Reset mode enabled: TOTP secret would be re-enrolled"
+    fi
     if [[ -f "$HOME/.google_authenticator" ]]; then
       info "[dry-run] Existing $HOME/.google_authenticator found; would prompt before overwrite"
     else
@@ -976,13 +1103,25 @@ if [[ "$SKIP_TOTP" == false ]]; then
   else
 
     if [[ -f "$HOME/.google_authenticator" ]]; then
-      warn "$HOME/.google_authenticator already exists"
-      if prompt_yes_no "Re-run google-authenticator and overwrite? [y/N] "; then
+      if [[ "$RESET_TOTP" == false ]]; then
+        warn "$HOME/.google_authenticator already exists"
+      fi
+      if [[ "$RESET_TOTP" == true ]]; then
+        info "Reset mode enabled: re-enrolling TOTP secret"
+        SETUP_TOTP=true
+      elif prompt_yes_no "Re-run google-authenticator and overwrite? [y/N] "; then
         SETUP_TOTP=true
       else
         info "Skipping TOTP setup"
       fi
     else
+      if [[ "$RESET_TOTP" == true ]]; then
+        fail_with_context \
+          "TOTP reset validation" \
+          "$HOME/.google_authenticator exists to reset" \
+          "Remove --reset-totp flag and retry with initial enrollment, or check that TOTP was previously set up" \
+          "Reset requested but no existing TOTP secret found"
+      fi
       SETUP_TOTP=true
     fi
 
@@ -1031,6 +1170,76 @@ else
 fi
 
 maybe_inject_failure "after-totp"
+
+# ── Step 4b: Disable factor artifacts ─────────────────────────────────────────
+if [[ "$DISABLE_TOTP" == true || "$DISABLE_YUBIKEY" == true ]]; then
+  step "Applying disable actions"
+
+  if [[ "$DISABLE_YUBIKEY" == true ]]; then
+    ESCAPED_USER=$(printf '%s' "$CURRENT_USER" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
+    if is_dry_run; then
+      if [[ -f "$U2F_MAPPINGS" ]]; then
+        info "[dry-run] Would remove YubiKey mapping entries for '$CURRENT_USER' from $U2F_MAPPINGS"
+      else
+        info "[dry-run] No $U2F_MAPPINGS file present; no YubiKey mapping removal needed"
+      fi
+    elif [[ -f "$U2F_MAPPINGS" ]]; then
+      if grep -q "^${ESCAPED_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+        if ! sudo sed -i "/^${ESCAPED_USER}:/d" "$U2F_MAPPINGS"; then
+          fail_with_context \
+            "Disable YubiKey mapping" \
+            "Existing mapping entries for '$CURRENT_USER' are removed" \
+            "Check sudo access and $U2F_MAPPINGS permissions" \
+            "Failed to remove user mapping entries"
+        fi
+        U2F_CHANGED=true
+
+        if grep -q "^${ESCAPED_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+          fail_with_context \
+            "Disable YubiKey mapping verification" \
+            "No mapping entries remain for '$CURRENT_USER'" \
+            "Inspect $U2F_MAPPINGS for malformed lines or regex edge cases" \
+            "User mapping entry still present after removal"
+        fi
+        success "Removed YubiKey mappings for '$CURRENT_USER'"
+      else
+        info "No YubiKey mapping entries found for '$CURRENT_USER'"
+      fi
+    else
+      info "No $U2F_MAPPINGS file found; nothing to disable for YubiKey mappings"
+    fi
+  fi
+
+  if [[ "$DISABLE_TOTP" == true ]]; then
+    if is_dry_run; then
+      if [[ -f "$HOME/.google_authenticator" ]]; then
+        info "[dry-run] Would remove $HOME/.google_authenticator"
+      else
+        info "[dry-run] No $HOME/.google_authenticator file present"
+      fi
+    elif [[ -f "$HOME/.google_authenticator" ]]; then
+      if ! rm -f "$HOME/.google_authenticator"; then
+        fail_with_context \
+          "Disable TOTP secret" \
+          "$HOME/.google_authenticator is removed" \
+          "Check file ownership and home directory permissions" \
+          "Failed to remove TOTP secret file"
+      fi
+      TOTP_CHANGED=true
+
+      if [[ -f "$HOME/.google_authenticator" ]]; then
+        fail_with_context \
+          "Disable TOTP secret verification" \
+          "$HOME/.google_authenticator no longer exists" \
+          "Verify file permissions and immutable attributes" \
+          "TOTP secret file still present after removal"
+      fi
+      success "Removed TOTP secret file"
+    else
+      info "No $HOME/.google_authenticator file found; nothing to disable for TOTP"
+    fi
+  fi
+fi
 
 # ── Step 5: Edit /etc/pam.d/gdm-password ─────────────────────────────────────
 step "Configuring /etc/pam.d/gdm-password"
