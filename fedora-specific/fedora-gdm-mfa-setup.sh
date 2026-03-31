@@ -168,6 +168,14 @@ prompt_yes_no() {
   [[ "${yn,,}" == "y" ]]
 }
 
+u2f_mapping_exists_for_user() {
+  local username="$1"
+  local escaped_user=''
+
+  escaped_user="$(printf '%s' "$username" | sed 's/[][\\.^$*+?{}|()]/\\&/g')"
+  sudo grep -q "^${escaped_user}:" "$U2F_MAPPINGS" 2>/dev/null
+}
+
 capture_u2f_mapping_with_retry() {
   local username="$1"
   local mode="${2:-primary}"
@@ -965,7 +973,7 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
         "No write access to $U2F_MAPPINGS"
     fi
 
-    if [[ -f "$U2F_MAPPINGS" ]] && grep -q "^${CURRENT_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+    if [[ -f "$U2F_MAPPINGS" ]] && u2f_mapping_exists_for_user "$CURRENT_USER"; then
       warn "YubiKey mapping for '$CURRENT_USER' already exists in $U2F_MAPPINGS"
       if [[ "$RESET_YUBIKEY" == true ]]; then
         info "Reset mode enabled: replacing existing YubiKey mapping for '$CURRENT_USER'"
@@ -1003,7 +1011,7 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
         fi
         U2F_CHANGED=true
 
-        if ! grep -q "^${ESCAPED_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+        if ! u2f_mapping_exists_for_user "$CURRENT_USER"; then
           fail_with_context \
             "YubiKey mapping verification" \
             "Mapping file contains entry for '$CURRENT_USER'" \
@@ -1031,7 +1039,7 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
       U2F_CHANGED=true
 
       ESCAPED_USER=$(printf '%s' "$CURRENT_USER" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
-      if ! grep -q "^${ESCAPED_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+      if ! u2f_mapping_exists_for_user "$CURRENT_USER"; then
         fail_with_context \
           "Primary YubiKey registration verification" \
           "Mapping file contains entry for '$CURRENT_USER'" \
@@ -1184,7 +1192,7 @@ if [[ "$DISABLE_TOTP" == true || "$DISABLE_YUBIKEY" == true ]]; then
         info "[dry-run] No $U2F_MAPPINGS file present; no YubiKey mapping removal needed"
       fi
     elif [[ -f "$U2F_MAPPINGS" ]]; then
-      if grep -q "^${ESCAPED_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+      if u2f_mapping_exists_for_user "$CURRENT_USER"; then
         if ! sudo sed -i "/^${ESCAPED_USER}:/d" "$U2F_MAPPINGS"; then
           fail_with_context \
             "Disable YubiKey mapping" \
@@ -1194,7 +1202,7 @@ if [[ "$DISABLE_TOTP" == true || "$DISABLE_YUBIKEY" == true ]]; then
         fi
         U2F_CHANGED=true
 
-        if grep -q "^${ESCAPED_USER}:" "$U2F_MAPPINGS" 2>/dev/null; then
+        if u2f_mapping_exists_for_user "$CURRENT_USER"; then
           fail_with_context \
             "Disable YubiKey mapping verification" \
             "No mapping entries remain for '$CURRENT_USER'" \
