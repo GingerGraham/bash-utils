@@ -689,6 +689,34 @@ if [[ "$DISABLE_YUBIKEY" == true ]]; then
   SKIP_YUBIKEY=true
 fi
 
+# Determine if user specified factor-specific operations
+USER_SPECIFIED_YUBIKEY_ONLY=false
+USER_SPECIFIED_TOTP_ONLY=false
+USER_SPECIFIED_TOKEN_RESET_ONLY=false
+
+if [[ "$RESET_YUBIKEY" == true || "$DISABLE_YUBIKEY" == true ]]; then
+  if [[ "$RESET_TOTP" != true && "$DISABLE_TOTP" != true ]]; then
+    # Only YubiKey operations specified, skip TOTP
+    USER_SPECIFIED_YUBIKEY_ONLY=true
+    SKIP_TOTP=true
+  fi
+fi
+
+if [[ "$RESET_TOTP" == true || "$DISABLE_TOTP" == true ]]; then
+  if [[ "$RESET_YUBIKEY" != true && "$DISABLE_YUBIKEY" != true ]]; then
+    # Only TOTP operations specified, skip YubiKey
+    USER_SPECIFIED_TOTP_ONLY=true
+    SKIP_YUBIKEY=true
+  fi
+fi
+
+# Track if we're only doing token resets (no MFA config changes)
+if [[ "$RESET_YUBIKEY" == true || "$RESET_TOTP" == true ]]; then
+  if [[ "$DISABLE_TOTP" != true && "$DISABLE_YUBIKEY" != true ]]; then
+    USER_SPECIFIED_TOKEN_RESET_ONLY=true
+  fi
+fi
+
 if [[ "$SELF_TEST" == true && "$SELF_TEST_CHILD" != true ]]; then
   run_self_test_suite
   exit 0
@@ -1262,13 +1290,19 @@ fi
 
 # Check if MFA lines already present
 if grep -q "pam_google_authenticator\|pam_u2f" "$GDM_PAM" 2>/dev/null; then
-  warn "MFA lines appear to already be present in $GDM_PAM"
-  grep -n "pam_google_authenticator\|pam_u2f" "$GDM_PAM"
-  if is_dry_run; then
-    info "[dry-run] Existing MFA lines detected; normalization preview will continue without prompting"
-  elif ! prompt_yes_no "Continue and overwrite? [y/N] "; then
-    warn "Skipping PAM edit"
+  # If we're only doing token resets (no MFA config changes), skip PAM modification entirely
+  if [[ "$USER_SPECIFIED_TOKEN_RESET_ONLY" == true ]]; then
+    info "MFA lines already present in $GDM_PAM; skipping PAM modification (token reset only)"
     SKIP_PAM=true
+  else
+    warn "MFA lines appear to already be present in $GDM_PAM"
+    grep -n "pam_google_authenticator\|pam_u2f" "$GDM_PAM"
+    if is_dry_run; then
+      info "[dry-run] Existing MFA lines detected; normalization preview will continue without prompting"
+    elif ! prompt_yes_no "Continue and overwrite? [y/N] "; then
+      warn "Skipping PAM edit"
+      SKIP_PAM=true
+    fi
   fi
 fi
 
