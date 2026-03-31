@@ -689,28 +689,21 @@ if [[ "$DISABLE_YUBIKEY" == true ]]; then
   SKIP_YUBIKEY=true
 fi
 
-# Determine if user specified factor-specific operations
-USER_SPECIFIED_YUBIKEY_ONLY=false
-USER_SPECIFIED_TOTP_ONLY=false
-USER_SPECIFIED_TOKEN_RESET_ONLY=false
-
+# If only YubiKey operations specified, automatically skip TOTP (and vice versa)
 if [[ "$RESET_YUBIKEY" == true || "$DISABLE_YUBIKEY" == true ]]; then
   if [[ "$RESET_TOTP" != true && "$DISABLE_TOTP" != true ]]; then
-    # Only YubiKey operations specified, skip TOTP
-    USER_SPECIFIED_YUBIKEY_ONLY=true
     SKIP_TOTP=true
   fi
 fi
 
 if [[ "$RESET_TOTP" == true || "$DISABLE_TOTP" == true ]]; then
   if [[ "$RESET_YUBIKEY" != true && "$DISABLE_YUBIKEY" != true ]]; then
-    # Only TOTP operations specified, skip YubiKey
-    USER_SPECIFIED_TOTP_ONLY=true
     SKIP_YUBIKEY=true
   fi
 fi
 
-# Track if we're only doing token resets (no MFA config changes)
+# Track if we're only doing token resets (no MFA config changes needed in PAM)
+USER_SPECIFIED_TOKEN_RESET_ONLY=false
 if [[ "$RESET_YUBIKEY" == true || "$RESET_TOTP" == true ]]; then
   if [[ "$DISABLE_TOTP" != true && "$DISABLE_YUBIKEY" != true ]]; then
     USER_SPECIFIED_TOKEN_RESET_ONLY=true
@@ -900,15 +893,18 @@ fi
 
 # ── Step 2: Authselect custom profile ─────────────────────────────────────────
 if [[ "$SKIP_AUTHSELECT" == false ]]; then
-  step "Creating authselect custom profile"
+  step "Configuring authselect custom profile"
 
+  PROFILE_EXISTS=false
   if authselect list 2>/dev/null | grep -q "custom/mfa-login"; then
-    warn "Profile 'custom/mfa-login' already exists — skipping creation"
-  else
+    PROFILE_EXISTS=true
+  fi
+
+  if [[ "$PROFILE_EXISTS" == false ]]; then
     BASE_PROFILE="$CURRENT_PROFILE_ID"
     [[ "$BASE_PROFILE" == "$AUTHSELECT_PROFILE" ]] && BASE_PROFILE="local"
     if is_dry_run; then
-      info "[dry-run] Would run: sudo authselect create-profile mfa-login --base-on $BASE_PROFILE"
+      info "[dry-run] Profile creation: sudo authselect create-profile mfa-login --base-on $BASE_PROFILE"
     else
       if ! sudo authselect create-profile mfa-login --base-on "$BASE_PROFILE"; then
         fail_with_context \
@@ -925,8 +921,10 @@ if [[ "$SKIP_AUTHSELECT" == false ]]; then
           "Inspect authselect output and /etc/authselect/custom" \
           "Profile not found after creation"
       fi
-      success "Profile created from '$BASE_PROFILE'"
+      success "Profile created from base '$BASE_PROFILE'"
     fi
+  else
+    info "Profile 'custom/mfa-login' already exists"
   fi
 
   TARGET_AUTHSELECT_FEATURES=("${CURRENT_FEATURES[@]}")
@@ -934,12 +932,13 @@ if [[ "$SKIP_AUTHSELECT" == false ]]; then
     TARGET_AUTHSELECT_FEATURES+=(with-fingerprint)
   fi
 
+  # Only select if not already using the MFA profile
   if [[ "$CURRENT_PROFILE_ID" != "$AUTHSELECT_PROFILE" ]]; then
     if is_dry_run; then
       if [[ ${#TARGET_AUTHSELECT_FEATURES[@]} -gt 0 ]]; then
-        info "[dry-run] Would run: sudo authselect select $AUTHSELECT_PROFILE ${TARGET_AUTHSELECT_FEATURES[*]} --force"
+        info "[dry-run] Profile activation: sudo authselect select $AUTHSELECT_PROFILE ${TARGET_AUTHSELECT_FEATURES[*]} --force"
       else
-        info "[dry-run] Would run: sudo authselect select $AUTHSELECT_PROFILE --force"
+        info "[dry-run] Profile activation: sudo authselect select $AUTHSELECT_PROFILE --force"
       fi
     else
       if ! sudo authselect select "$AUTHSELECT_PROFILE" "${TARGET_AUTHSELECT_FEATURES[@]}" --force; then
@@ -961,10 +960,10 @@ if [[ "$SKIP_AUTHSELECT" == false ]]; then
           "Run 'authselect current' and verify no conflicting manual PAM edits" \
           "Current profile after selection: '${UPDATED_PROFILE_ID:-unknown}'"
       fi
-      success "Profile '$AUTHSELECT_PROFILE' applied with preserved features"
+      success "Profile activated: '$AUTHSELECT_PROFILE' with preserved features"
     fi
   else
-    success "Profile '$AUTHSELECT_PROFILE' already active"
+    info "Profile '$AUTHSELECT_PROFILE' already active"
   fi
 
   info "Current profile:"
@@ -1003,16 +1002,18 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
 
     if [[ -f "$U2F_MAPPINGS" ]] && u2f_mapping_exists_for_user "$CURRENT_USER"; then
       warn "YubiKey mapping for '$CURRENT_USER' already exists in $U2F_MAPPINGS"
+      REPLACE_YUBIKEY_MAPPING=false
+      
       if [[ "$RESET_YUBIKEY" == true ]]; then
         info "Reset mode enabled: replacing existing YubiKey mapping for '$CURRENT_USER'"
         REPLACE_YUBIKEY_MAPPING=true
-      elif prompt_yes_no "Register an additional/replacement key? [y/N] "; then
-        REPLACE_YUBIKEY_MAPPING=true
+      elif ! prompt_yes_no "Register an additional/replacement key? [y/N] "; then
+        info "Skipping YubiKey key replacement"
       else
-        REPLACE_YUBIKEY_MAPPING=false
+        REPLACE_YUBIKEY_MAPPING=true
       fi
 
-      if [[ "${REPLACE_YUBIKEY_MAPPING:-false}" == true ]]; then
+      if [[ "${REPLACE_YUBIKEY_MAPPING}" == true ]]; then
         info "Touch your YubiKey when prompted..."
         if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" primary)"; then
           fail_with_context \
@@ -1077,24 +1078,27 @@ if [[ "$SKIP_YUBIKEY" == false ]]; then
       success "YubiKey registered to $U2F_MAPPINGS"
     fi
 
-    if prompt_yes_no "Register a backup YubiKey? [y/N] "; then
-      info "Touch your backup YubiKey..."
-      if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" backup)"; then
-        fail_with_context \
-          "Backup YubiKey registration" \
-          "A valid backup key mapping is generated for '$CURRENT_USER'" \
-          "Ensure the backup key is attached to the machine running this script and supports U2F/FIDO2" \
-          "pamu2fcfg failed after 3 attempts"
+    # Only prompt for backup key during initial setup or reset, not during other operations
+    if [[ "$RESET_YUBIKEY" != true && "$DISABLE_YUBIKEY" != true ]]; then
+      if prompt_yes_no "Register a backup YubiKey? [y/N] "; then
+        info "Touch your backup YubiKey..."
+        if ! MAPPING="$(capture_u2f_mapping_with_retry "$CURRENT_USER" backup)"; then
+          fail_with_context \
+            "Backup YubiKey registration" \
+            "A valid backup key mapping is generated for '$CURRENT_USER'" \
+            "Ensure the backup key is attached to the machine running this script and supports U2F/FIDO2" \
+            "pamu2fcfg failed after 3 attempts"
+        fi
+        if ! echo "$MAPPING" | sudo tee -a "$U2F_MAPPINGS" > /dev/null; then
+          fail_with_context \
+            "Backup YubiKey registration" \
+            "Backup key mapping is appended for '$CURRENT_USER'" \
+            "Check sudo privileges and destination file permissions" \
+            "Failed writing backup mapping"
+        fi
+        U2F_CHANGED=true
+        success "Backup YubiKey registered"
       fi
-      if ! echo "$MAPPING" | sudo tee -a "$U2F_MAPPINGS" > /dev/null; then
-        fail_with_context \
-          "Backup YubiKey registration" \
-          "Backup key mapping is appended for '$CURRENT_USER'" \
-          "Check sudo privileges and destination file permissions" \
-          "Failed writing backup mapping"
-      fi
-      U2F_CHANGED=true
-      success "Backup YubiKey registered"
     fi
 
     if ! sudo chmod 644 "$U2F_MAPPINGS"; then
@@ -1137,18 +1141,16 @@ if [[ "$SKIP_TOTP" == false ]]; then
       info "[dry-run] Would run google-authenticator to create $HOME/.google_authenticator"
     fi
   else
+    SETUP_TOTP=false
 
     if [[ -f "$HOME/.google_authenticator" ]]; then
-      if [[ "$RESET_TOTP" == false ]]; then
-        warn "$HOME/.google_authenticator already exists"
-      fi
       if [[ "$RESET_TOTP" == true ]]; then
         info "Reset mode enabled: re-enrolling TOTP secret"
         SETUP_TOTP=true
-      elif prompt_yes_no "Re-run google-authenticator and overwrite? [y/N] "; then
+      elif prompt_yes_no "TOTP secret already exists. Re-run google-authenticator and overwrite? [y/N] "; then
         SETUP_TOTP=true
       else
-        info "Skipping TOTP setup"
+        info "Keeping existing TOTP secret"
       fi
     else
       if [[ "$RESET_TOTP" == true ]]; then
@@ -1158,10 +1160,11 @@ if [[ "$SKIP_TOTP" == false ]]; then
           "Remove --reset-totp flag and retry with initial enrollment, or check that TOTP was previously set up" \
           "Reset requested but no existing TOTP secret found"
       fi
+      info "Setting up new TOTP secret"
       SETUP_TOTP=true
     fi
 
-    if [[ "${SETUP_TOTP:-false}" == true ]]; then
+    if [[ "${SETUP_TOTP}" == true ]]; then
       echo ""
       info "Running google-authenticator. Scan the QR code with your TOTP app."
       info "Recommended answers: time-based=yes, update file=yes, disallow reuse=yes, rate limit=yes"
@@ -1288,18 +1291,43 @@ if [[ ! -f "$GDM_PAM" ]]; then
     "PAM file does not exist: $GDM_PAM"
 fi
 
-# Check if MFA lines already present
+# Determine PAM action per factor:
+#   enable   = actively insert/update the line (factor being configured now)
+#   preserve = leave any existing line as-is (factor skipped, not disabled)
+#   disable  = strip the line  (--disable-* was specified)
+ENABLE_U2F=false
+ENABLE_TOTP=false
+PRESERVE_U2F=false
+PRESERVE_TOTP=false
+
+if [[ "$DISABLE_YUBIKEY" == true ]]; then
+  : # ENABLE_U2F=false, PRESERVE_U2F=false → strip, do not reinsert
+elif [[ "$SKIP_YUBIKEY" == true ]]; then
+  PRESERVE_U2F=true
+else
+  ENABLE_U2F=true
+fi
+
+if [[ "$DISABLE_TOTP" == true ]]; then
+  : # ENABLE_TOTP=false, PRESERVE_TOTP=false → strip, do not reinsert
+elif [[ "$SKIP_TOTP" == true ]]; then
+  PRESERVE_TOTP=true
+else
+  ENABLE_TOTP=true
+fi
+
+# Only prompt when disabling a factor that is currently active — anything else
+# is either additive, idempotent, or a preserve (no structural change).
 if grep -q "pam_google_authenticator\|pam_u2f" "$GDM_PAM" 2>/dev/null; then
-  # If we're only doing token resets (no MFA config changes), skip PAM modification entirely
   if [[ "$USER_SPECIFIED_TOKEN_RESET_ONLY" == true ]]; then
     info "MFA lines already present in $GDM_PAM; skipping PAM modification (token reset only)"
     SKIP_PAM=true
-  else
-    warn "MFA lines appear to already be present in $GDM_PAM"
+  elif [[ "$DISABLE_TOTP" == true || "$DISABLE_YUBIKEY" == true ]]; then
+    warn "MFA lines will be removed from $GDM_PAM due to --disable-* flag"
     grep -n "pam_google_authenticator\|pam_u2f" "$GDM_PAM"
     if is_dry_run; then
-      info "[dry-run] Existing MFA lines detected; normalization preview will continue without prompting"
-    elif ! prompt_yes_no "Continue and overwrite? [y/N] "; then
+      info "[dry-run] Disable requested; normalization preview will continue without prompting"
+    elif ! prompt_yes_no "Remove MFA factor(s) from PAM? [y/N] "; then
       warn "Skipping PAM edit"
       SKIP_PAM=true
     fi
@@ -1339,22 +1367,22 @@ if [[ "${SKIP_PAM:-false}" != true ]]; then
     success "Backup created: ${GDM_PAM}.bak.*"
   fi
 
-  if [[ "$SKIP_YUBIKEY" == true && "$SKIP_TOTP" == true ]]; then
-    warn "Both TOTP and YubiKey skipped — no MFA lines to insert"
+  if [[ "$ENABLE_U2F" == false && "$ENABLE_TOTP" == false && \
+        "$PRESERVE_U2F" == false && "$PRESERVE_TOTP" == false ]]; then
+    warn "Both TOTP and YubiKey disabled or skipped — no MFA lines will be present"
   else
-    ENABLE_U2F=false
-    ENABLE_TOTP=false
-    [[ "$SKIP_YUBIKEY" == false ]] && ENABLE_U2F=true
-    [[ "$SKIP_TOTP" == false ]] && ENABLE_TOTP=true
-
     NORMALIZED_PAM="$ROLLBACK_DIR/gdm-password.normalized"
     if ! awk \
       -v enable_u2f="$ENABLE_U2F" \
       -v enable_totp="$ENABLE_TOTP" \
+      -v preserve_u2f="$PRESERVE_U2F" \
+      -v preserve_totp="$PRESERVE_TOTP" \
       '
-        BEGIN { inserted=0 }
+        BEGIN { anchor_found=0 }
         {
+          # Anchor line: print it, then insert any enabled MFA lines immediately after
           if ($0 ~ /^[[:space:]]*auth[[:space:]]+substack[[:space:]]+password-auth([[:space:]]|$)/) {
+            anchor_found=1
             print
             if (enable_u2f == "true") {
               print "auth        [success=1 default=ignore]  pam_u2f.so authfile=/etc/u2f_mappings cue nouserok"
@@ -1362,22 +1390,29 @@ if [[ "${SKIP_PAM:-false}" != true ]]; then
             if (enable_totp == "true") {
               print "auth        required      pam_google_authenticator.so nullok"
             }
-            inserted=1
             next
           }
 
+          # Existing U2F lines: pass through if preserving, strip otherwise
           if ($0 ~ /^[[:space:]]*auth[[:space:]].*pam_u2f\.so([[:space:]]|$)/) {
+            if (preserve_u2f == "true") {
+              print
+            }
             next
           }
 
+          # Existing TOTP lines: pass through if preserving, strip otherwise
           if ($0 ~ /^[[:space:]]*auth[[:space:]].*pam_google_authenticator\.so([[:space:]]|$)/) {
+            if (preserve_totp == "true") {
+              print
+            }
             next
           }
 
           print
         }
         END {
-          if (inserted == 0) {
+          if (anchor_found == 0) {
             exit 3
           }
         }
@@ -1422,10 +1457,10 @@ if [[ "${SKIP_PAM:-false}" != true ]]; then
         "Observed pam_u2f line count: $U2F_COUNT"
     fi
 
-    if [[ "$ENABLE_U2F" == false && "$U2F_COUNT" -ne 0 ]]; then
+    if [[ "$ENABLE_U2F" == false && "$PRESERVE_U2F" == false && "$U2F_COUNT" -ne 0 ]]; then
       fail_with_context \
         "PAM U2F normalization verification" \
-        "No U2F auth line exists when U2F is skipped" \
+        "No U2F auth line exists when U2F is disabled" \
         "Inspect $GDM_PAM auth section for stale pam_u2f entries" \
         "Observed pam_u2f line count: $U2F_COUNT"
     fi
@@ -1438,10 +1473,10 @@ if [[ "${SKIP_PAM:-false}" != true ]]; then
         "Observed pam_google_authenticator line count: $TOTP_COUNT"
     fi
 
-    if [[ "$ENABLE_TOTP" == false && "$TOTP_COUNT" -ne 0 ]]; then
+    if [[ "$ENABLE_TOTP" == false && "$PRESERVE_TOTP" == false && "$TOTP_COUNT" -ne 0 ]]; then
       fail_with_context \
         "PAM TOTP normalization verification" \
-        "No TOTP auth line exists when TOTP is skipped" \
+        "No TOTP auth line exists when TOTP is disabled" \
         "Inspect $GDM_PAM auth section for stale pam_google_authenticator entries" \
         "Observed pam_google_authenticator line count: $TOTP_COUNT"
     fi
@@ -1454,23 +1489,25 @@ fi
 maybe_inject_failure "after-pam"
 
 # ── Step 6: SELinux policy ────────────────────────────────────────────────────
-step "Installing SELinux policy module"
+# Only install SELinux module if at least one MFA factor is enabled
+if [[ "$ENABLE_U2F" == true || "$ENABLE_TOTP" == true ]]; then
+  step "Installing SELinux policy module"
 
-SELINUX_MODE=$(getenforce 2>/dev/null || true)
-if [[ -z "$SELINUX_MODE" ]]; then
-  fail_with_context \
-    "SELinux mode detection" \
-    "SELinux mode is detectable via getenforce" \
-    "Check SELinux tool installation and system policy state" \
-    "getenforce returned no output"
-fi
+  SELINUX_MODE=$(getenforce 2>/dev/null || true)
+  if [[ -z "$SELINUX_MODE" ]]; then
+    fail_with_context \
+      "SELinux mode detection" \
+      "SELinux mode is detectable via getenforce" \
+      "Check SELinux tool installation and system policy state" \
+      "getenforce returned no output"
+  fi
 
-if [[ "$SELINUX_MODE" == "Disabled" ]]; then
-  warn "SELinux is disabled; skipping module install because no policy enforcement is active"
-  SELINUX_SKIPPED=true
-fi
+  if [[ "$SELINUX_MODE" == "Disabled" ]]; then
+    warn "SELinux is disabled; skipping module install because no policy enforcement is active"
+    SELINUX_SKIPPED=true
+  fi
 
-if [[ "${SELINUX_SKIPPED:-false}" != true ]]; then
+  if [[ "${SELINUX_SKIPPED:-false}" != true ]]; then
   if selinux_module_is_installed; then
     success "SELinux module '${SELINUX_MODULE_NAME}' already installed; no change needed"
   else
@@ -1529,19 +1566,22 @@ EOF
     fi
   fi
 
-  # Verify
-  if is_dry_run; then
-    info "[dry-run] Skipping strict SELinux activation verification"
-  elif selinux_module_is_installed; then
-    success "SELinux module confirmed active:"
-    show_selinux_module_entries
-  else
-    fail_with_context \
-      "SELinux module verification" \
-      "Module '$SELINUX_MODULE_NAME' (or '$SELINUX_MODULE_NAME_ALT') appears in semodule -l" \
-      "Check semodule installation logs and module name consistency" \
-      "Module not found after installation"
+    # Verify
+    if is_dry_run; then
+      info "[dry-run] Skipping strict SELinux activation verification"
+    elif selinux_module_is_installed; then
+      success "SELinux module confirmed active:"
+      show_selinux_module_entries
+    else
+      fail_with_context \
+        "SELinux module verification" \
+        "Module '$SELINUX_MODULE_NAME' (or '$SELINUX_MODULE_NAME_ALT') appears in semodule -l" \
+        "Check semodule installation logs and module name consistency" \
+        "Module not found after installation"
+    fi
   fi
+else
+  info "No MFA factors enabled; skipping SELinux module installation"
 fi
 
 maybe_inject_failure "after-selinux"
